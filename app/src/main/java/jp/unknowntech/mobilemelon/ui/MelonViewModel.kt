@@ -1,17 +1,26 @@
 package jp.unknowntech.mobilemelon.ui
 
 import android.app.Application
+import android.nfc.Tag
+import android.nfc.TagLostException
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import jp.unknowntech.mobilemelon.data.BalanceResult
 import jp.unknowntech.mobilemelon.data.CardId
 import jp.unknowntech.mobilemelon.data.CardStore
 import jp.unknowntech.mobilemelon.data.MelonApi
+import jp.unknowntech.mobilemelon.data.MelonApiException
 import jp.unknowntech.mobilemelon.data.SelfBalance
+import jp.unknowntech.mobilemelon.nfc.CardFlow
+import jp.unknowntech.mobilemelon.nfc.FelicaProtocolException
+import jp.unknowntech.mobilemelon.nfc.connectFelica
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** The home screen's balance state, shown once a card ID is registered. */
 sealed interface BalanceUi {
@@ -23,13 +32,13 @@ sealed interface BalanceUi {
     data class Error(val message: String) : BalanceUi
 }
 
-/** The card-tap (NFC) read flow's state. */
+/** The card-tap (NFC mutual-authentication) flow's state. */
 sealed interface ReadState {
     /** Waiting for a card to be tapped. */
     data object Waiting : ReadState
 
-    /** A card was read; querying its balance. */
-    data object Querying : ReadState
+    /** A card was tapped; relaying the mutual authentication. */
+    data object Authenticating : ReadState
     data class Loaded(val balance: SelfBalance) : ReadState
     data object NotRegistered : ReadState
 
@@ -53,9 +62,14 @@ class MelonViewModel(app: Application) : AndroidViewModel(app) {
     private val _readState = MutableStateFlow<ReadState>(ReadState.Waiting)
     val readState: StateFlow<ReadState> = _readState.asStateFlow()
 
+    /** One tap in flight at a time — Reader Mode re-dispatches the same card. */
+    private val handling = AtomicBoolean(false)
+
     init {
         if (_idiHex.value != null) refresh()
     }
+
+    // ----- saved card ID (typed) -----
 
     /** The saved card in its canonical display form, or null. */
     fun currentCardId(): String? =
@@ -90,32 +104,60 @@ class MelonViewModel(app: Application) : AndroidViewModel(app) {
             _balance.value = when (val res = MelonApi.selfBalanceByIdi(CardId.SYSTEM_CODE, hex)) {
                 is BalanceResult.Success -> BalanceUi.Loaded(res.balance)
                 is BalanceResult.NotRegistered -> BalanceUi.NotRegistered
-                is BalanceResult.Unsupported -> BalanceUi.Error("このカードは利用できません。")
                 is BalanceResult.Error -> BalanceUi.Error(res.message)
             }
         }
     }
 
-    /** Reset the card-tap flow to wait for a fresh tap. */
+    // ----- card-present (tap + mutual authentication) -----
+
+    /** Reset the card-tap flow to wait for a fresh tap (ignored mid-relay). */
     fun resetRead() {
-        _readState.value = ReadState.Waiting
+        if (!handling.get()) _readState.value = ReadState.Waiting
     }
 
     /**
-     * A FeliCa card was tapped: look up its balance by IDm. Called from the NFC
-     * reader-mode callback, which runs off the main thread — [MutableStateFlow]
-     * and `viewModelScope.launch` are both safe there.
+     * A FeliCa card was tapped. Connect **on this (reader-callback) thread** so the
+     * tag handle stays valid, then relay the server-driven mutual authentication on
+     * a background coroutine and show the balance it returns.
      */
-    fun onCardRead(systemCode: Int, idmHex: String) {
-        if (_readState.value is ReadState.Querying) return
-        _readState.value = ReadState.Querying
-        viewModelScope.launch {
-            _readState.value = when (val res = MelonApi.selfBalanceByIdm(systemCode, idmHex)) {
-                is BalanceResult.Success -> ReadState.Loaded(res.balance)
-                is BalanceResult.NotRegistered -> ReadState.NotRegistered
-                is BalanceResult.Unsupported -> ReadState.Unsupported
-                is BalanceResult.Error -> ReadState.Error(res.message)
-            }
+    fun onTag(tag: Tag) {
+        if (!handling.compareAndSet(false, true)) return
+        val nfcF = try {
+            connectFelica(tag)
+        } catch (e: Exception) {
+            handling.set(false)
+            _readState.value = classify(e)
+            return
         }
+        _readState.value = ReadState.Authenticating
+        viewModelScope.launch(Dispatchers.IO) {
+            val next = try {
+                ReadState.Loaded(CardFlow.authenticate(nfcF))
+            } catch (e: Exception) {
+                classify(e)
+            } finally {
+                runCatching { nfcF.close() }
+                handling.set(false)
+            }
+            _readState.value = next
+        }
+    }
+
+    private fun classify(e: Throwable): ReadState = when {
+        e is MelonApiException && e.status == 404 -> ReadState.NotRegistered
+        e is MelonApiException && (e.status == 422 || e.code == "UNSUPPORTED_CARD") ->
+            ReadState.Unsupported
+
+        e is TagLostException ->
+            ReadState.Error("カードが離れました。認証が終わるまでかざし続けてください。")
+
+        e is FelicaProtocolException ->
+            ReadState.Error("カードの読み取りに失敗しました。もう一度お試しください。")
+
+        e is IOException ->
+            ReadState.Error("通信に失敗しました。電波状況をご確認ください。")
+
+        else -> ReadState.Error(e.message ?: "不明なエラーが発生しました。")
     }
 }

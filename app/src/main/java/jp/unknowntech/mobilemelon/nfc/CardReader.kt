@@ -6,13 +6,22 @@ import android.content.ContextWrapper
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.NfcF
-
-/** A FeliCa card as read off the NFC field. */
-data class FelicaCard(val systemCode: Int, val idmHex: String)
+import java.io.IOException
 
 /** Reader-mode flags: NFC-F (FeliCa) only, and skip the NDEF check we don't need. */
 val READER_FLAGS: Int =
     NfcAdapter.FLAG_READER_NFC_F or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
+
+/**
+ * A longer presence-check delay stops the platform from constantly re-polling a
+ * card that stays on the reader during the multi-frame auth relay (which churns
+ * tag handles and logs "Tag is out of date"). We connect the moment a tag is
+ * discovered, so slower presence checks don't hurt responsiveness.
+ */
+const val READER_PRESENCE_CHECK_DELAY_MS = 1000
+
+/** Per-transceive timeout (ms) — generous so a slow crypto step doesn't abort. */
+private const val TRANSCEIVE_TIMEOUT_MS = 2000
 
 /** Walk the ContextWrapper chain to the hosting Activity, or null. */
 fun Context.findActivity(): Activity? {
@@ -25,28 +34,15 @@ fun Context.findActivity(): Activity? {
 }
 
 /**
- * Parse a discovered NFC-F [Tag] into its IDm + System Code. For NFC-F, the tag's
- * id is the IDm (NFCID2); the System Code comes from the poll response.
+ * Connect [NfcF] for [tag] **on the calling thread**. Must be called straight from
+ * the NFC reader-mode callback thread: deferring `connect()` onto another thread
+ * leaves a window in which the platform re-issues the tag handle and invalidates
+ * this one ("Tag … is out of date"). The caller owns the connection and MUST
+ * [NfcF.close] it when finished.
  */
-fun Tag.toFelicaCard(): FelicaCard? {
-    val idm = id ?: return null
-    if (idm.size != 8) return null
-    val sc = NfcF.get(this)?.systemCode
-    val systemCode = if (sc != null && sc.size >= 2) {
-        ((sc[0].toInt() and 0xFF) shl 8) or (sc[1].toInt() and 0xFF)
-    } else {
-        0x0003
-    }
-    return FelicaCard(systemCode, idm.toHex())
-}
-
-private fun ByteArray.toHex(): String {
-    val digits = "0123456789abcdef"
-    val sb = StringBuilder(size * 2)
-    for (b in this) {
-        val v = b.toInt() and 0xFF
-        sb.append(digits[v ushr 4])
-        sb.append(digits[v and 0x0F])
-    }
-    return sb.toString()
+fun connectFelica(tag: Tag): NfcF {
+    val nfcF = NfcF.get(tag) ?: throw IOException("FeliCa（NFC-F）ではないカードです")
+    nfcF.connect()
+    runCatching { nfcF.timeout = TRANSCEIVE_TIMEOUT_MS }
+    return nfcF
 }

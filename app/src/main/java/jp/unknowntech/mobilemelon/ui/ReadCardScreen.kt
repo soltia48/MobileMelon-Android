@@ -2,6 +2,7 @@ package jp.unknowntech.mobilemelon.ui
 
 import android.content.Intent
 import android.nfc.NfcAdapter
+import android.os.Bundle
 import android.provider.Settings
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -24,8 +25,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import jp.unknowntech.mobilemelon.nfc.READER_FLAGS
+import jp.unknowntech.mobilemelon.nfc.READER_PRESENCE_CHECK_DELAY_MS
 import jp.unknowntech.mobilemelon.nfc.findActivity
-import jp.unknowntech.mobilemelon.nfc.toFelicaCard
 
 @Composable
 fun ReadCardScreen(
@@ -43,10 +44,11 @@ fun ReadCardScreen(
     // Reader mode is bound to the Activity; enable it only while this screen shows.
     DisposableEffect(activity, nfcAdapter) {
         if (activity != null && nfcAdapter != null && nfcAdapter.isEnabled) {
-            val callback = NfcAdapter.ReaderCallback { tag ->
-                tag.toFelicaCard()?.let { vm.onCardRead(it.systemCode, it.idmHex) }
+            val extras = Bundle().apply {
+                putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, READER_PRESENCE_CHECK_DELAY_MS)
             }
-            nfcAdapter.enableReaderMode(activity, callback, READER_FLAGS, null)
+            val callback = NfcAdapter.ReaderCallback { tag -> vm.onTag(tag) }
+            nfcAdapter.enableReaderMode(activity, callback, READER_FLAGS, extras)
             onDispose { runCatching { nfcAdapter.disableReaderMode(activity) } }
         } else {
             onDispose {}
@@ -79,9 +81,11 @@ fun ReadCardScreen(
 @Composable
 private fun ReadContent(state: ReadState, onReset: () -> Unit) {
     when (state) {
-        is ReadState.Waiting -> Prompt("カードを端末の背面にかざしてください")
+        is ReadState.Waiting -> Prompt(
+            "カードを端末の背面にかざし、\n認証が終わるまで離さないでください",
+        )
 
-        is ReadState.Querying -> LoadingColumn("照会中…")
+        is ReadState.Authenticating -> LoadingColumn("認証中… カードを離さないでください")
 
         is ReadState.Loaded -> {
             BalanceCard(state.balance)
@@ -102,7 +106,7 @@ private fun ReadContent(state: ReadState, onReset: () -> Unit) {
         )
 
         is ReadState.Error -> ResultWithRetry(
-            "残高を取得できませんでした: ${state.message}",
+            state.message,
             error = true,
             onReset = onReset,
         )

@@ -13,22 +13,22 @@
 
 - カード ID（IDi の文字列形）を入力・保存し、ホームで残高を表示
 - 設定画面でカード ID を編集・削除
-- NFC でカードをかざして、その IDm から残高を照会
+- NFC でカードをかざし、相互認証して残高を照会
 - 残高の合計と、6ヶ月失効の**有効期限別内訳**を表示
 
 ## 仕組み
 
-melon のサーバは、口座を `(System Code, IDm, IDi)` で識別します。本アプリはそのうち利用者が知り得る識別子を使って、無認証の読み取り専用エンドポイント **`POST /v1/self/balance`** を呼び出します。
+melon のサーバは、口座を `(System Code, IDm, IDi)` で識別します。本アプリは 2 通りの経路でサーバのセルフ照会 API を呼び出します。
 
-| 照会方法 | 使う識別子 | 取得元 |
+| 照会方法 | 経路 | エンドポイント |
 |---|---|---|
-| カード ID 入力 | **IDi** | 財布アプリ表示の「カード ID」を、アプリが IDi（16桁hex）へ復元 |
-| カードをかざす | **IDm** | NFC リーダーモードでカードから読み取り |
+| カード ID 入力 | IDi を**主張**（低信頼・利便） | `POST /v1/self/balance` |
+| カードをかざす | **相互認証**でカード実在を証明（高信頼） | `POST /v1/self/authenticate` |
 
-- **カード ID ↔ IDi の変換**（[`data/CardId.kt`](app/src/main/java/jp/unknowntech/mobilemelon/data/CardId.kt)）は、交通系IC（サイバネ規格）の IDi 文字列表現に基づく可逆変換です。発行者識別子（例: `JE` = JR東日本）・発行日・連番から元の 8 バイト IDi を復元します。
-- **NFC 読み取り**（[`nfc/CardReader.kt`](app/src/main/java/jp/unknowntech/mobilemelon/nfc/CardReader.kt)）は標準の `NfcAdapter` リーダーモード（`FLAG_READER_NFC_F`）で、かざされた**外部カード**の IDm（`tag.id`）と System Code を取得します。端末自身の SE には触れないため、特別な権限や登録は不要です。
+- **カード ID 入力**：モバイル Suica / PASMO 等が表示する「カード ID」を入力すると、アプリが IDi（16桁hex）へ復元して送ります（[`data/CardId.kt`](app/src/main/java/jp/unknowntech/mobilemelon/data/CardId.kt)、交通系IC＝サイバネ規格の可逆変換）。IDi を主張するだけなので、便利ですが低信頼の経路です。
+- **カードをかざす**：標準の `NfcAdapter` リーダーモード（`FLAG_READER_NFC_F`）でカードにコマンドフレームを中継し（[`nfc/`](app/src/main/java/jp/unknowntech/mobilemelon/nfc/)）、**サーバ主導の相互認証**を行います。鍵はサーバが保持し、アプリはフレームを運ぶだけ。**検証済み IDi を得るのはサーバのみ**で、アプリには残高だけが返ります。カードを物理的に持っていることを証明する高信頼の経路です（複数往復するため、認証が終わるまでカードを離さない必要があります）。
 
-サーバ応答は残高合計と失効内訳のみで、生の IDi/IDm や加盟店情報は返しません。
+いずれもサーバ応答は残高合計と失効内訳のみで、生の IDi/IDm や加盟店情報は返しません。
 
 ## 画面構成
 
@@ -54,12 +54,14 @@ app/src/main/java/jp/unknowntech/mobilemelon/
 ├── data/
 │   ├── CardId.kt                カード ID ⇄ IDi の変換
 │   ├── CardStore.kt             IDi の永続化（SharedPreferences）
-│   └── MelonApi.kt              /v1/self/balance の呼び出し
+│   └── MelonApi.kt              self/balance・self/authenticate の呼び出し
 ├── nfc/
-│   └── CardReader.kt            NFC-F タグ → IDm / System Code
+│   ├── CardReader.kt            リーダーモード補助・タグ接続
+│   ├── Felica.kt                FeliCa フレーム（Polling / 中継 transceive）
+│   └── CardFlow.kt              相互認証の中継オーケストレーション
 └── ui/
     ├── MobileMelonApp.kt        ヘッダと3画面のナビ
-    ├── MelonViewModel.kt        保存カードの残高・NFC 読み取りの状態
+    ├── MelonViewModel.kt        保存カードの残高・カード読み取りの状態
     ├── HomeScreen.kt            ホーム（残高表示）
     ├── SettingsScreen.kt        設定（カード ID 編集）
     ├── ReadCardScreen.kt        カード読み取り（リーダーモード）
@@ -96,21 +98,26 @@ buildConfigField("String", "MELON_API_BASE_URL", "\"https://melon.unknowntech.jp
 
 ## サーバ API
 
-**`POST /v1/self/balance`**（無認証・読み取り専用）。本文で `idi` または `idm` のどちらか一方を送ります。
+いずれも無認証。詳細は melon リポジトリの [`docs/api.md`](https://github.com/soltia48/melon) 参照。
 
-```jsonc
-// カード ID（IDi）で照会
+**`POST /v1/self/balance`** — カード ID（IDi）で照会。
+
+```json
 { "system_code": 3, "idi": "0102030405060708" }
-// NFC で読んだ IDm で照会
-{ "system_code": 3, "idm": "0102030405060708" }
 ```
 
-| ステータス | 意味 |
-|---|---|
-| 200 | 残高を返す（0 を含む） |
-| 404 | この識別子の口座が未登録 |
-| 422 | IDm が乱数化・未発行のカード |
-| 400 | 形式不正、または識別子が 1 つに絞られていない |
+**`POST /v1/self/authenticate`** — かざして相互認証（3ステップ中継）。サーバがフレームを駆動し、完了時に検証済みカードの残高を返す（IDi は返さない）。
+
+```jsonc
+// 開始
+{ "system_code": 3, "idm": "…", "pmm": "…", "areas": [0], "services": [0] }
+//   → { "step": "auth1", "session_id": "…", "command": { "frame": "…" } }
+// 継続（完了まで）
+{ "session_id": "…", "card_response": "…" }
+//   → { "step": "complete", "result": { "system_code": 3, "total": 700, "buckets": […] } }
+```
+
+いずれも成功応答（`self/balance` は 200、`self/authenticate` は `result`）は残高合計と失効内訳のみ。404＝未登録、422＝乱数化 IDm、400＝形式不正。
 
 ```json
 { "system_code": 3, "total": 700,
