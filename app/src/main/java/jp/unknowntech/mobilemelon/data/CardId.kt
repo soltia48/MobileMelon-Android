@@ -1,5 +1,8 @@
 package jp.unknowntech.mobilemelon.data
 
+import jp.unknowntech.mobilemelon.data.CardId.parse
+
+
 /**
  * Converts between the **card ID** — the human-readable string that transit-IC
  * wallet apps (Mobile Suica, PASMO, etc.) show — and the 8-byte **IDi** it
